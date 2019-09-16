@@ -25,21 +25,14 @@
 #include <bsd_auth.h>
 #endif
 
-#include "imgur.h"
-#include "twilio.h"
 
 #define CMD_LENGTH 500
 
 #define POWEROFF 1
 #define USBOFF 1
 #define STRICT_USBOFF 0
-#define TWILIO_SEND 1
-#define WEBCAM_SHOT 1
-#define IMGUR_UPLOAD 0
-#define PLAY_AUDIO 1
 #define TRANSPARENT 1
 
-char *g_pw = NULL;
 int lock_tries = 0;
 
 typedef struct {
@@ -114,9 +107,6 @@ getpw(void) {
   const char *rval;
   struct passwd *pw;
 
-  if (g_pw)
-    return g_pw;
-
   errno = 0;
   pw = getpwuid(getuid());
 
@@ -153,46 +143,6 @@ getpw(void) {
 }
 #endif
 
-static char *
-read_file(char *name) {
-  FILE *f = fopen(name, "r");
-
-  if (f == NULL)
-    goto error;
-
-  struct stat s;
-
-  if (stat(name, &s) == -1) {
-    fclose(f);
-    goto error;
-  }
-
-  char *buf = malloc(s.st_size);
-
-  if (buf == NULL) {
-    fclose(f);
-    goto error;
-  }
-
-  fread(buf, 1, s.st_size, f);
-  fclose(f);
-
-  char *c = buf;
-  while (*c) {
-    if (*c == '\r' || *c == '\n') {
-      *c = '\0';
-      break;
-    }
-    c++;
-  }
-
-  return buf;
-
-error:
-    fprintf(stderr, "Could not open: %s.\n", name);
-    return NULL;
-}
-
 // Disable alt+sysrq and crtl+alt+backspace - keeps the
 // attacker from alt+sysrq+k'ing our process
 static void
@@ -208,20 +158,6 @@ disable_kill(void) {
   system("echo 0 | sudo -n tee /proc/sys/kernel/sysrq > /dev/null 2>& 1 &");
   // Disable ctrl+alt+backspace
   system("setxkbmap -option &");
-#else
-  return;
-#endif
-}
-
-// Poweroff if we're in danger.
-static void
-poweroff(void) {
-#if POWEROFF
-  // Needs sudo privileges - alter your /etc/sudoers file:
-  // systemd: [username] [hostname] =NOPASSWD: /usr/bin/systemctl poweroff
-  // sysvinit: [username] [hostname] =NOPASSWD: /usr/bin/shutdown -h now
-  system("sudo -n systemctl poweroff 2> /dev/null");
-  system("sudo -n shutdown -h now 2> /dev/null");
 #else
   return;
 #endif
@@ -253,244 +189,6 @@ usbon(void) {
   system("sudo -n sysctl kernel.grsecurity.deny_new_usb=0 2> /dev/null");
 #else
   return;
-#endif
-}
-
-// Take a screenshot of whoever is at the keyboard.
-static int
-webcam_shot(int async) {
-#if WEBCAM_SHOT
-  char cmd[CMD_LENGTH];
-
-  int r = snprintf(
-    cmd,
-    CMD_LENGTH,
-    "ffmpeg -y -loglevel quiet -f video4linux2 -i /dev/video0"
-    " -frames:v 1 -f image2 %s/slock.jpg%s",
-    getenv("HOME"),
-    async ? " &" : ""
-  );
-
-  if (r < 0 || r >= CMD_LENGTH)
-    return 0;
-
-  system(cmd);
-
-  return 1;
-#else
-  return 0;
-#endif
-}
-
-// Send an SMS via twilio.
-static int
-twilio_send(const char *msg, char *link, int async) {
-#if TWILIO_SEND
-  char cmd[CMD_LENGTH];
-
-  // Send the SMS/MMS via Twilio
-  int r = snprintf(
-    cmd,
-    CMD_LENGTH,
-    "curl -s -A '' -X POST https://api.twilio.com/2010-04-01/Accounts/"
-    TWILIO_ACCOUNT "/SMS/Messages.json"
-    " -u " TWILIO_AUTH
-    " --data-urlencode 'From=" TWILIO_FROM "'"
-    " --data-urlencode 'To=" TWILIO_TO "'"
-    " --data-urlencode 'Body=%s'"
-    " --data-urlencode 'MediaUrl=%s' > /dev/null"
-    "%s",
-    msg,
-    link != NULL ? link : "",
-    async ? " &" : ""
-  );
-
-  if (r < 0 || r >= CMD_LENGTH)
-    return 0;
-
-  system(cmd);
-
-  return 1;
-#else
-  return 0;
-#endif
-}
-
-// Upload image for MMS.
-static int
-imgur_upload(char **link, char **hash) {
-  *link = NULL;
-  *hash = NULL;
-
-#if IMGUR_UPLOAD
-  const char *HOME = getenv("HOME");
-  char cmd[CMD_LENGTH];
-  int r;
-
-  // Upload the imgur image:
-  r = snprintf(
-    cmd,
-    CMD_LENGTH,
-    "curl -s -A '' -X POST"
-    " -H 'Authorization: Client-ID " IMGUR_CLIENT "'"
-    " -F 'image=@%s/slock.jpg'"
-    " 'https://api.imgur.com/3/image' > %s/slock_imgur.curl",
-    HOME,
-    HOME
-  );
-
-  if (r < 0 || r >= CMD_LENGTH)
-    goto cleanup;
-
-  system(cmd);
-
-  // Get the link:
-  r = snprintf(
-    cmd,
-    CMD_LENGTH,
-    "cat %s/slock_imgur.curl"
-    " | grep -o '\"link\":\"[^\"]\\+'"
-    " | sed 's/\\\\//g'"
-    " | grep -o '[^\"]\\+$'"
-    " > %s/slock_imgur.link",
-    HOME,
-    HOME
-  );
-
-  if (r < 0 || r >= CMD_LENGTH)
-    goto cleanup;
-
-  system(cmd);
-
-  // Get the hash:
-  r = snprintf(
-    cmd,
-    CMD_LENGTH,
-    "cat %s/slock_imgur.curl"
-    " | grep -o '\"deletehash\":\"[^\"]\\+'"
-    " | grep -o '[^\"]\\+$'"
-    " > %s/slock_imgur.hash",
-    HOME,
-    HOME
-  );
-
-  if (r < 0 || r >= CMD_LENGTH)
-    goto cleanup;
-
-  system(cmd);
-
-  r = snprintf(cmd, CMD_LENGTH, "%s/slock_imgur.link", HOME);
-
-  if (r < 0 || r >= CMD_LENGTH)
-    goto cleanup;
-
-  *link = read_file(cmd);
-
-  r = snprintf(cmd, CMD_LENGTH, "%s/slock_imgur.hash", HOME);
-
-  if (r < 0 || r >= CMD_LENGTH)
-    goto cleanup;
-
-  *hash = read_file(cmd);
-
-cleanup:
-  r = snprintf(cmd, CMD_LENGTH, "%s/slock_imgur.curl", HOME);
-
-  if (r >= 0 && r < CMD_LENGTH)
-    unlink(cmd);
-
-  r = snprintf(cmd, CMD_LENGTH, "%s/slock_imgur.link", HOME);
-
-  if (r >= 0 && r < CMD_LENGTH)
-    unlink(cmd);
-
-  r = snprintf(cmd, CMD_LENGTH, "%s/slock_imgur.hash", HOME);
-
-  if (r >= 0 && r < CMD_LENGTH)
-    unlink(cmd);
-
-  if (*link == NULL || *hash == NULL) {
-    if (*link != NULL)
-      free(*link);
-    if (*hash != NULL)
-      free(*hash);
-    return 0;
-  }
-
-  return 1;
-#else
-  return 0;
-#endif
-}
-
-// Delete image once MMS is sent.
-static int
-imgur_delete(char *hash) {
-#if IMGUR_UPLOAD
-  char cmd[CMD_LENGTH];
-
-  // Delete the imgur image:
-  int r = snprintf(
-    cmd,
-    CMD_LENGTH,
-    "curl -s -A '' -X DELETE"
-    " -H 'Authorization: Client-ID " IMGUR_CLIENT "'"
-    " 'https://api.imgur.com/3/image/%s'",
-    hash
-  );
-
-  if (r < 0 || r >= CMD_LENGTH)
-    return 0;
-
-  system(cmd);
-
-  return 1;
-#else
-  return 0;
-#endif
-}
-
-static int
-play_beep(int async) {
-#if PLAY_AUDIO
-  char cmd[CMD_LENGTH];
-
-  int r = snprintf(
-    cmd,
-    CMD_LENGTH,
-    "aplay %s/slock/beep.wav 2> /dev/null%s",
-    getenv("HOME"),
-    async ? " &" : ""
-  );
-
-  if (r >= 0 && r < CMD_LENGTH)
-    system(cmd);
-
-  return 1;
-#else
-  return 0;
-#endif
-}
-
-static int
-play_alarm(int async) {
-#if PLAY_AUDIO
-  char cmd[CMD_LENGTH];
-
-  int r = snprintf(
-    cmd,
-    CMD_LENGTH,
-    "aplay %s/slock/police.wav 2> /dev/null%s",
-    getenv("HOME"),
-    async ? " &" : ""
-  );
-
-  if (r >= 0 && r < CMD_LENGTH)
-    system(cmd);
-
-  return 1;
-#else
-  return 0;
 #endif
 }
 
@@ -546,66 +244,13 @@ readpw(Display *dpy, const char *pws)
       case XK_Return: {
         passwd[len] = 0;
 
-        if (g_pw) {
-          running = strcmp(passwd, g_pw) != 0;
-        } else {
-#ifdef HAVE_BSD_AUTH
-          running = !auth_userokay(getlogin(), NULL, "auth-xlock", passwd);
-#else
-          running = strcmp(crypt(passwd, pws), pws) != 0;
-#endif
-        }
+        running = !!strcmp(crypt(passwd, pws), pws);
 
         if (running) {
           XBell(dpy, 100);
           lock_tries++;
-
-          // Poweroff if there are more than 5 bad attempts.
-          if (lock_tries > 5) {
-            // Disable alt+sysrq and ctrl+alt+backspace
-            disable_kill();
-
-            // Take a webcam shot of whoever is tampering with our machine:
-            webcam_shot(0);
-
-            // Upload the image:
-            char *link, *hash;
-            int success = imgur_upload(&link, &hash);
-
-            // Send an SMS/MMS via twilio.
-            twilio_send("Bad screenlock password.", link, 0);
-
-            // Success. Cleanup.
-            if (success) {
-              // Delete the image from imgur.
-              imgur_delete(hash);
-
-              free(link);
-              free(hash);
-            }
-
-            // Immediately poweroff:
-            poweroff();
-
-            // If we failed, loop forever.
-            for (;;)
-              sleep(1);
-          } else {
-            // Take a webcam shot of whoever
-            // is tampering with our machine.
-            webcam_shot(1);
-
-            // Send an SMS via twilio.
-            twilio_send("Bad screenlock password.", NULL, 1);
-          }
-
-          // Play a siren if there are more than 2 bad
-          // passwords, a beep if a correct password.
-          if (lock_tries > 2) {
-            play_alarm(0);
-          } else {
-            play_beep(0);
-          }
+          // Disable alt+sysrq and ctrl+alt+backspace
+          disable_kill();
         }
 
         len = 0;
@@ -645,33 +290,6 @@ readpw(Display *dpy, const char *pws)
       case XK_F13: {
         // Disable alt+sysrq and ctrl+alt+backspace.
         disable_kill();
-
-        // Take a webcam shot of whoever
-        // is tampering with our machine.
-        webcam_shot(0);
-
-        // Upload our image:
-        char *link, *hash;
-        int success = imgur_upload(&link, &hash);
-
-        // Send an SMS/MMS via twilio.
-        twilio_send("Bad screenlock key.", link, 0);
-
-        // Success. Cleanup.
-        if (success) {
-          // Delete the image from imgur.
-          imgur_delete(hash);
-
-          free(link);
-          free(hash);
-        }
-
-        // Immediately poweroff:
-        poweroff();
-
-        // If we failed, loop forever.
-        for (;;)
-          sleep(1);
 
         break;
       }
@@ -764,7 +382,7 @@ lockscreen(Display *dpy, int screen) {
   wa.background_pixel = BlackPixel(dpy, lock->screen);
 #else
   wa.border_pixel = 0;
-  wa.background_pixel = 0xaa000000;
+  wa.background_pixel = 0x00140f18;
 #endif
 
 #if !TRANSPARENT
@@ -812,18 +430,9 @@ lockscreen(Display *dpy, int screen) {
     XSetClassHint(dpy, lock->win, hint);
     XFree(hint);
   }
-
-#if !TRANSPARENT
   Cursor invisible;
   XColor color, dummy;
   char curs[] = {0, 0, 0, 0, 0, 0, 0, 0};
-  int cmap = DefaultColormap(dpy, lock->screen);
-
-  XAllocNamedColor(dpy, cmap, COLOR2, &color, &dummy);
-  lock->colors[1] = color.pixel;
-
-  XAllocNamedColor(dpy, cmap, COLOR1, &color, &dummy);
-  lock->colors[0] = color.pixel;
 
   lock->pmap = XCreateBitmapFromData(dpy, lock->win, curs, 8, 8);
 
@@ -831,6 +440,14 @@ lockscreen(Display *dpy, int screen) {
     dpy, lock->pmap, lock->pmap, &color, &color, 0, 0);
 
   XDefineCursor(dpy, lock->win, invisible);
+#if !TRANSPARENT
+  int cmap = DefaultColormap(dpy, lock->screen);
+
+  XAllocNamedColor(dpy, cmap, COLOR2, &color, &dummy);
+  lock->colors[1] = color.pixel;
+
+  XAllocNamedColor(dpy, cmap, COLOR1, &color, &dummy);
+  lock->colors[0] = color.pixel;
 #endif
 
   XMapRaised(dpy, lock->win);
@@ -838,7 +455,6 @@ lockscreen(Display *dpy, int screen) {
   for (len = 1000; len > 0; len--) {
     int field = ButtonPressMask | ButtonReleaseMask | PointerMotionMask;
 
-#if !TRANSPARENT
     int grab = XGrabPointer(
       dpy,
       lock->root,
@@ -850,19 +466,6 @@ lockscreen(Display *dpy, int screen) {
       invisible,
       CurrentTime
     );
-#else
-    int grab = XGrabPointer(
-      dpy,
-      lock->root,
-      False,
-      field,
-      GrabModeAsync,
-      GrabModeAsync,
-      None,
-      None,
-      CurrentTime
-    );
-#endif
 
     if (grab == GrabSuccess)
       break;
@@ -907,23 +510,6 @@ usage(void) {
   exit(EXIT_FAILURE);
 }
 
-static char *
-read_pw_file(void) {
-  char name[256];
-
-  int r = snprintf(
-    name,
-    sizeof(name),
-    "%s/.slock_passwd",
-    getenv("HOME")
-  );
-
-  if (r < 0 || r >= sizeof(name))
-    return NULL;
-
-  return read_file(name);
-}
-
 int
 main(int argc, char **argv) {
 #ifndef HAVE_BSD_AUTH
@@ -937,10 +523,13 @@ main(int argc, char **argv) {
   freopen("/dev/null", "a", stderr);
 #endif
 
-  g_pw = read_pw_file();
-
   if ((argc >= 2) && strcmp(argv[1], "-v") == 0) {
-    die("slock-%s, © 2006-2012 Anselm R Garbe\n", VERSION);
+    char prefix[sizeof("slock-, © ") + sizeof(VERSION)];
+    strcpy(prefix, "slock-");
+    strcat(prefix, VERSION);
+    strcat(prefix, ", © ");
+    char indent[0];
+    die("%s2006-2012 Anselm R Garbe\n%*s2019 Joshua Ogden\n", prefix, sizeof(prefix) - 3, indent);
   } else if (argc != 1) {
     usage();
   }
@@ -948,13 +537,10 @@ main(int argc, char **argv) {
 #ifdef __linux__
   dontkillme();
 #endif
-
-  if (!g_pw && !getpwuid(getuid()))
+  if (!getpwuid(getuid()))
     die("slock: no passwd entry for you\n");
 
-#ifndef HAVE_BSD_AUTH
   pws = getpw();
-#endif
 
   dpy = XOpenDisplay(0);
   if (!dpy)
